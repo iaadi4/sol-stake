@@ -1,10 +1,14 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, TokenAccount, Token};
+use anchor_spl::token::{Mint, TokenAccount, Token, Transfer};
 
 declare_id!("E8E9zijhTNpPPuexRFYjiyqstFwHoJN7mNPNLvPpv6F1");
 
+const PRECISION: u128 = 1_000_000_000_000;
+
 #[program]
 pub mod sol_stake {
+    use anchor_spl::token;
+
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>, reward_rate: u64, stake_cap: u64) -> Result<()> {
@@ -19,13 +23,14 @@ pub mod sol_stake {
         let pool = &mut ctx.accounts.pool;
 
         pool.authority = authority.key();
-        pool.reward_rate = reward_rate;
+        pool.last_reward_balance = reward_token_vault.amount;
         pool.reward_token_mint = reward_token_mint.key();
         pool.stake_token_mint = stake_token_mint.key();
         pool.stake_token_vault = stake_token_vault.key();
         pool.reward_token_vault = reward_token_vault.key();
         pool.stake_cap = stake_cap;
         pool.total_staked = 0;
+        pool.acc_reward_per_share = 0;
         pool.bump = ctx.bumps.pool;
 
         pool.created_at_ts = clock.unix_timestamp;
@@ -35,6 +40,109 @@ pub mod sol_stake {
 
         Ok(())
     }
+
+    pub fn stake(ctx: Context<Stake>, stake_amount: u64) -> Result<()> {
+        let user = &mut ctx.accounts.user;
+        let pool = &mut ctx.accounts.pool;
+        let user_stake = &mut ctx.accounts.user_stake;
+        let stake_token_mint = &mut ctx.accounts.stake_token_mint;
+
+        require!(
+            pool.total_staked + (stake_amount as u128) <= pool.stake_cap as u128,
+            CustomError::StakeCapExceeded
+        );
+
+        let pool_key = pool.key();
+
+        let authority_seed = &[b"pool_authority", pool_key.as_ref(), &[ctx.bumps.authority]];
+        let signer = &[&authority_seed[..]];
+
+        let pending = (user_stake.stake_amount as u128)
+            .checked_mul(pool.acc_reward_per_share)
+            .unwrap()
+            .checked_div(PRECISION)
+            .unwrap()
+            .checked_sub(user_stake.reward_debt)
+            .unwrap();
+
+        if pending > 0 {
+            let reward_tranfer_cpi_accounts = Transfer {
+                from: ctx.accounts.reward_token_vault.to_account_info(),
+                to: ctx.accounts.user_reward_account.to_account_info(),
+                authority: ctx.accounts.authority.to_account_info()
+            };
+
+            let reward_transfer_cpi_tx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                reward_tranfer_cpi_accounts,
+                signer
+            );
+
+            token::transfer(reward_transfer_cpi_tx, pending as u64)?;
+        }
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.user_stake_account.to_account_info(),
+            to: ctx.accounts.stake_token_vault.to_account_info(),
+            authority: user.to_account_info()
+        };
+
+        let cpi_tx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+
+        token::transfer(cpi_tx, stake_amount)?;
+
+        user_stake.stake_amount = user_stake.stake_amount.checked_add(stake_amount).unwrap();
+        pool.total_staked  = pool.total_staked.checked_add(stake_amount as u128).unwrap();
+
+        user_stake.reward_debt = (user_stake.stake_amount as u128)
+            .checked_mul(pool.acc_reward_per_share)
+            .unwrap()
+            .checked_div(PRECISION)
+            .unwrap();
+
+        user_stake.pool = ctx.accounts.pool.key();
+        user_stake.stake_token_mint = stake_token_mint.key();
+        user_stake.last_stake_time = ctx.accounts.clock.unix_timestamp;
+        user_stake.bump = ctx.bumps.user_stake;
+
+        Ok(())
+    }
+
+    pub fn distribute(ctx: Context<Distribute>) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let current_balance = ctx.accounts.reward_token_vault.amount;
+
+        let new_rewards = current_balance
+            .checked_sub(pool.last_reward_balance)
+            .unwrap();
+
+        if pool.total_staked == 0 || new_rewards == 0 {
+            return Ok(());
+        }
+
+        pool.acc_reward_per_share = pool
+            .acc_reward_per_share
+            .checked_add(
+                (new_rewards as u128)
+                    .checked_mul(PRECISION).unwrap()
+                    .checked_div(pool.total_staked as u128).unwrap()
+            )
+            .unwrap();
+
+        pool.last_reward_balance = current_balance;
+
+        Ok(())
+    }
+
+}
+
+#[error_code]
+pub enum CustomError {
+    #[msg("Stake cap exceeded")]
+    StakeCapExceeded,
 }
 
 #[derive(Accounts)]
@@ -81,8 +189,8 @@ pub struct Initialize<'info> {
 
     pub rent: Sysvar<'info, Rent>,
     pub clock: Sysvar<'info, Clock>,
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>
 }
 
 #[derive(Accounts)]
@@ -90,7 +198,11 @@ pub struct Stake<'info> {
     #[account(mut)] pub user: Signer<'info>,
     #[account(mut)] pub pool: Account<'info, Pool>,
     #[account(mut)] pub stake_token_mint: Account<'info, Mint>,
-    
+    #[account(mut)] pub user_stake_account: Account<'info, TokenAccount>,
+    #[account(mut)] pub user_reward_account: Account<'info, TokenAccount>,
+    #[account(mut)] pub stake_token_vault: Account<'info, TokenAccount>,
+    #[account(mut)] pub reward_token_vault: Account<'info, TokenAccount>,
+
     #[account(
         init,
         payer = user,
@@ -100,8 +212,27 @@ pub struct Stake<'info> {
     )]
     pub user_stake: Account<'info, UserStake>,
 
+    /// CHECK: This PDA is used as the authority for vaults
+    #[account(
+        seeds = [b"pool_authority", pool.key().as_ref()],
+        bump,
+    )]
+    pub authority: UncheckedAccount<'info>,
+    
+    pub rent: Sysvar<'info, Rent>,
+    pub clock: Sysvar<'info, Clock>,
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>
 }
+
+#[derive(Accounts)]
+pub struct Distribute<'info> {
+    #[account(mut, has_one = reward_token_vault)]
+    pub pool: Account<'info, Pool>,
+    #[account()]
+    pub reward_token_vault: Account<'info, TokenAccount>,
+}
+
 
 #[account]
 #[derive(InitSpace)]
@@ -109,7 +240,7 @@ pub struct UserStake {
     pub pool: Pubkey,
     pub stake_token_mint: Pubkey,
     pub stake_amount: u64,
-    pub last_stake_time: u64,
+    pub last_stake_time: i64,
     pub reward_debt: u128,
     pub bump: u8
 }
@@ -122,8 +253,9 @@ pub struct Pool {
     pub reward_token_mint: Pubkey,
     pub stake_token_vault: Pubkey,
     pub reward_token_vault: Pubkey,
-    pub total_staked: u64,
-    pub reward_rate: u64,
+    pub acc_reward_per_share: u128,
+    pub total_staked: u128,
+    pub last_reward_balance: u64,
     pub created_at_epoch: u64,
     pub updated_at_epoch: u64,
     pub created_at_ts: i64,
