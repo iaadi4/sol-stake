@@ -11,7 +11,7 @@ pub mod sol_stake {
 
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, reward_rate: u64, stake_cap: u64) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, stake_cap: u64) -> Result<()> {
         let reward_token_mint = &mut ctx.accounts.reward_token_mint;
         let stake_token_mint = &mut ctx.accounts.stake_token_mint;
         let stake_token_vault = &mut ctx.accounts.stake_token_vault;
@@ -20,7 +20,7 @@ pub mod sol_stake {
         let clock = &ctx.accounts.clock;
 
         let authority = &mut ctx.accounts.authority;
-        let pool = &mut ctx.accounts.pool;
+        let pool: &mut Account<'_, Pool> = &mut ctx.accounts.pool;
 
         pool.authority = authority.key();
         pool.last_reward_balance = reward_token_vault.amount;
@@ -45,7 +45,6 @@ pub mod sol_stake {
         let user = &mut ctx.accounts.user;
         let pool = &mut ctx.accounts.pool;
         let user_stake = &mut ctx.accounts.user_stake;
-        let stake_token_mint = &mut ctx.accounts.stake_token_mint;
 
         require!(
             pool.total_staked + (stake_amount as u128) <= pool.stake_cap as u128,
@@ -66,6 +65,11 @@ pub mod sol_stake {
             .unwrap();
 
         if pending > 0 {
+            require!(
+                ctx.accounts.reward_token_vault.mint == ctx.accounts.user_reward_account.mint,
+                CustomError::InvalidRewardTokenMint
+            );
+
             let reward_tranfer_cpi_accounts = Transfer {
                 from: ctx.accounts.reward_token_vault.to_account_info(),
                 to: ctx.accounts.user_reward_account.to_account_info(),
@@ -80,6 +84,11 @@ pub mod sol_stake {
 
             token::transfer(reward_transfer_cpi_tx, pending as u64)?;
         }
+
+        require!(
+            ctx.accounts.stake_token_vault.mint == ctx.accounts.user_stake_account.mint,
+            CustomError::InvalidStakeTokenMint
+        );
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.user_stake_account.to_account_info(),
@@ -104,7 +113,6 @@ pub mod sol_stake {
             .unwrap();
 
         user_stake.pool = ctx.accounts.pool.key();
-        user_stake.stake_token_mint = stake_token_mint.key();
         user_stake.last_stake_time = ctx.accounts.clock.unix_timestamp;
         user_stake.bump = ctx.bumps.user_stake;
 
@@ -143,6 +151,10 @@ pub mod sol_stake {
 pub enum CustomError {
     #[msg("Stake cap exceeded")]
     StakeCapExceeded,
+    #[msg("Invalid reward token mint")]
+    InvalidRewardTokenMint,
+    #[msg("Invalid stake token mint")]
+    InvalidStakeTokenMint,
 }
 
 #[derive(Accounts)]
@@ -196,15 +208,17 @@ pub struct Initialize<'info> {
 #[derive(Accounts)]
 pub struct Stake<'info> {
     #[account(mut)] pub user: Signer<'info>,
-    #[account(mut)] pub pool: Account<'info, Pool>,
-    #[account(mut)] pub stake_token_mint: Account<'info, Mint>,
-    #[account(mut)] pub user_stake_account: Account<'info, TokenAccount>,
-    #[account(mut)] pub user_reward_account: Account<'info, TokenAccount>,
+    #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
+    pub pool: Account<'info, Pool>,
+    #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
+    pub user_stake_account: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
+    pub user_reward_account: Account<'info, TokenAccount>,
     #[account(mut)] pub stake_token_vault: Account<'info, TokenAccount>,
     #[account(mut)] pub reward_token_vault: Account<'info, TokenAccount>,
 
     #[account(
-        init,
+        init_if_needed,
         payer = user,
         seeds = [b"user_stake", pool.key().as_ref(), user.key().as_ref()],
         bump,
@@ -232,7 +246,6 @@ pub struct Distribute<'info> {
     #[account()]
     pub reward_token_vault: Account<'info, TokenAccount>,
 }
-
 
 #[account]
 #[derive(InitSpace)]
