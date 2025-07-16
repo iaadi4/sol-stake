@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, TokenAccount, Token, Transfer};
+use anchor_spl::token::{Mint, Token, TokenAccount, Transfer};
 
 declare_id!("E8E9zijhTNpPPuexRFYjiyqstFwHoJN7mNPNLvPpv6F1");
 
@@ -16,7 +16,7 @@ pub mod sol_stake {
         let stake_token_mint = &mut ctx.accounts.stake_token_mint;
         let stake_token_vault = &mut ctx.accounts.stake_token_vault;
         let reward_token_vault = &mut ctx.accounts.reward_token_vault;
-        
+
         let clock = &ctx.accounts.clock;
 
         let authority = &mut ctx.accounts.authority;
@@ -73,13 +73,13 @@ pub mod sol_stake {
             let reward_tranfer_cpi_accounts = Transfer {
                 from: ctx.accounts.reward_token_vault.to_account_info(),
                 to: ctx.accounts.user_reward_account.to_account_info(),
-                authority: ctx.accounts.authority.to_account_info()
+                authority: ctx.accounts.authority.to_account_info(),
             };
 
             let reward_transfer_cpi_tx = CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 reward_tranfer_cpi_accounts,
-                signer
+                signer,
             );
 
             token::transfer(reward_transfer_cpi_tx, pending as u64)?;
@@ -93,18 +93,15 @@ pub mod sol_stake {
         let cpi_accounts = Transfer {
             from: ctx.accounts.user_stake_account.to_account_info(),
             to: ctx.accounts.stake_token_vault.to_account_info(),
-            authority: user.to_account_info()
+            authority: user.to_account_info(),
         };
 
-        let cpi_tx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-        );
+        let cpi_tx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
 
         token::transfer(cpi_tx, stake_amount)?;
 
         user_stake.stake_amount = user_stake.stake_amount.checked_add(stake_amount).unwrap();
-        pool.total_staked  = pool.total_staked.checked_add(stake_amount as u128).unwrap();
+        pool.total_staked = pool.total_staked.checked_add(stake_amount as u128).unwrap();
 
         user_stake.reward_debt = (user_stake.stake_amount as u128)
             .checked_mul(pool.acc_reward_per_share)
@@ -115,6 +112,116 @@ pub mod sol_stake {
         user_stake.pool = ctx.accounts.pool.key();
         user_stake.last_stake_time = ctx.accounts.clock.unix_timestamp;
         user_stake.bump = ctx.bumps.user_stake;
+
+        Ok(())
+    }
+
+    pub fn claim(ctx: Context<Claim>) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let user_stake = &mut ctx.accounts.user_stake;
+        let clock = Clock::get().unwrap();
+
+        let pending = (user_stake.stake_amount as u128)
+            .checked_mul(pool.acc_reward_per_share)
+            .unwrap()
+            .checked_div(PRECISION)
+            .unwrap()
+            .checked_sub(user_stake.reward_debt)
+            .unwrap();
+
+        if pending > 0 {
+            let pool_key = pool.key();
+            let authority_seed = &[b"pool_authority", pool_key.as_ref(), &[ctx.bumps.authority]];
+            let signer = &[&authority_seed[..]];
+
+            let reward_accounts = Transfer {
+                from: ctx.accounts.reward_token_vault.to_account_info(),
+                to: ctx.accounts.user_reward_account.to_account_info(),
+                authority: ctx.accounts.authority.to_account_info(),
+            };
+            let cpi = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                reward_accounts,
+                signer,
+            );
+
+            token::transfer(cpi, pending as u64)?;
+            pool.last_reward_balance = ctx.accounts.reward_token_vault.amount;
+        }
+
+        user_stake.reward_debt = (user_stake.stake_amount as u128)
+            .checked_mul(pool.acc_reward_per_share)
+            .unwrap()
+            .checked_div(PRECISION)
+            .unwrap();
+        user_stake.last_stake_time = clock.unix_timestamp;
+
+        Ok(())
+    }
+
+    pub fn unstake(ctx: Context<Unstake>, amount: u64) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let user_stake = &mut ctx.accounts.user_stake;
+        let clock = Clock::get().unwrap();
+
+        let pending = (user_stake.stake_amount as u128)
+            .checked_mul(pool.acc_reward_per_share)
+            .unwrap()
+            .checked_div(PRECISION)
+            .unwrap()
+            .checked_sub(user_stake.reward_debt)
+            .unwrap();
+
+        if pending > 0 {
+            let pool_key = pool.key();
+            let authority_seed = &[b"pool_authority", pool_key.as_ref(), &[ctx.bumps.authority]];
+            let signer = &[&authority_seed[..]];
+
+            let reward_accounts = Transfer {
+                from: ctx.accounts.reward_token_vault.to_account_info(),
+                to: ctx.accounts.user_reward_account.to_account_info(),
+                authority: ctx.accounts.authority.to_account_info(),
+            };
+            let cpi = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                reward_accounts,
+                signer,
+            );
+
+            token::transfer(cpi, pending as u64)?;
+            pool.last_reward_balance = ctx.accounts.reward_token_vault.amount;
+        }
+
+        require!(
+            amount <= user_stake.stake_amount,
+            CustomError::InsufficientStake
+        );
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.stake_token_vault.to_account_info(),
+            to: ctx.accounts.user_stake_account.to_account_info(),
+            authority: ctx.accounts.authority.to_account_info(),
+        };
+        let pool_key = pool.key();
+        let authority_seed = &[b"pool_authority", pool_key.as_ref(), &[ctx.bumps.authority]];
+        let signer = &[&authority_seed[..]];
+        let cpi = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+
+        token::transfer(cpi, amount)?;
+
+        user_stake.stake_amount = user_stake.stake_amount.checked_sub(amount).unwrap();
+        pool.total_staked = pool.total_staked.checked_sub(amount as u128).unwrap();
+
+        user_stake.reward_debt = (user_stake.stake_amount as u128)
+            .checked_mul(pool.acc_reward_per_share)
+            .unwrap()
+            .checked_div(PRECISION)
+            .unwrap();
+        user_stake.last_stake_time = clock.unix_timestamp;
 
         Ok(())
     }
@@ -135,8 +242,10 @@ pub mod sol_stake {
             .acc_reward_per_share
             .checked_add(
                 (new_rewards as u128)
-                    .checked_mul(PRECISION).unwrap()
-                    .checked_div(pool.total_staked as u128).unwrap()
+                    .checked_mul(PRECISION)
+                    .unwrap()
+                    .checked_div(pool.total_staked as u128)
+                    .unwrap(),
             )
             .unwrap();
 
@@ -144,7 +253,6 @@ pub mod sol_stake {
 
         Ok(())
     }
-
 }
 
 #[error_code]
@@ -155,13 +263,18 @@ pub enum CustomError {
     InvalidRewardTokenMint,
     #[msg("Invalid stake token mint")]
     InvalidStakeTokenMint,
+    #[msg("Insufficient stake to unstake")]
+    InsufficientStake,
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(mut)] pub user: Signer<'info>,
-    #[account(mut)] pub reward_token_mint: Account<'info, Mint>,
-    #[account(mut)] pub stake_token_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub reward_token_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub stake_token_mint: Account<'info, Mint>,
 
     #[account(
         init,
@@ -207,15 +320,18 @@ pub struct Initialize<'info> {
 
 #[derive(Accounts)]
 pub struct Stake<'info> {
-    #[account(mut)] pub user: Signer<'info>,
+    #[account(mut)]
+    pub user: Signer<'info>,
     #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
     pub pool: Account<'info, Pool>,
     #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
     pub user_stake_account: Account<'info, TokenAccount>,
     #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
     pub user_reward_account: Account<'info, TokenAccount>,
-    #[account(mut)] pub stake_token_vault: Account<'info, TokenAccount>,
-    #[account(mut)] pub reward_token_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub stake_token_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub reward_token_vault: Account<'info, TokenAccount>,
 
     #[account(
         init_if_needed,
@@ -232,11 +348,11 @@ pub struct Stake<'info> {
         bump,
     )]
     pub authority: UncheckedAccount<'info>,
-    
+
     pub rent: Sysvar<'info, Rent>,
     pub clock: Sysvar<'info, Clock>,
     pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -247,6 +363,62 @@ pub struct Distribute<'info> {
     pub reward_token_vault: Account<'info, TokenAccount>,
 }
 
+#[derive(Accounts)]
+pub struct Claim<'info> {
+    #[account(mut)] pub user: Signer<'info>,
+    #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
+    pub pool: Account<'info, Pool>,
+    #[account(mut)]
+    pub stake_token_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub reward_token_vault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
+    pub user_stake_account: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
+    pub user_reward_account: Account<'info, TokenAccount>,
+    #[account(mut,
+        seeds = [b"user_stake", pool.key().as_ref(), user.key().as_ref()],
+        bump = user_stake.bump,
+        has_one = pool
+    )]
+    pub user_stake: Account<'info, UserStake>,
+
+    /// CHECK: This PDA is used as the authority for vaults
+    #[account(
+        seeds = [b"pool_authority", pool.key().as_ref()],
+        bump,
+    )]
+    pub authority: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct Unstake<'info> {
+    #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
+    pub pool: Account<'info, Pool>,
+    #[account(mut)] pub stake_token_vault: Account<'info, TokenAccount>,
+    #[account(mut)] pub reward_token_vault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
+    pub user_stake_account: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
+    pub user_reward_account: Account<'info, TokenAccount>,
+    #[account(mut,
+        seeds = [b"user_stake", pool.key().as_ref(), user.key().as_ref()],
+        bump = user_stake.bump,
+        has_one = pool
+    )]
+    pub user_stake: Account<'info, UserStake>,
+    #[account(mut)] pub user: Signer<'info>,
+    #[account(
+        seeds = [b"pool_authority", pool.key().as_ref()],
+        bump,
+    )]
+    pub authority: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+
 #[account]
 #[derive(InitSpace)]
 pub struct UserStake {
@@ -255,7 +427,7 @@ pub struct UserStake {
     pub stake_amount: u64,
     pub last_stake_time: i64,
     pub reward_debt: u128,
-    pub bump: u8
+    pub bump: u8,
 }
 
 #[account]
