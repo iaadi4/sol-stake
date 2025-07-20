@@ -268,13 +268,14 @@ pub enum CustomError {
 }
 
 #[derive(Accounts)]
+#[instruction(stake_cap: u64)]
 pub struct Initialize<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
+#[account(mut)]
+    pub reward_token_mint: Box<Account<'info, Mint>>,
     #[account(mut)]
-    pub reward_token_mint: Account<'info, Mint>,
-    #[account(mut)]
-    pub stake_token_mint: Account<'info, Mint>,
+    pub stake_token_mint: Box<Account<'info, Mint>>,
 
     #[account(
         init,
@@ -293,7 +294,7 @@ pub struct Initialize<'info> {
         token::mint = reward_token_mint,
         token::authority = authority
     )]
-    pub reward_token_vault: Account<'info, TokenAccount>,
+    pub reward_token_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         init,
@@ -303,9 +304,9 @@ pub struct Initialize<'info> {
         token::mint = stake_token_mint,
         token::authority = authority
     )]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: Box<Account<'info, TokenAccount>>,
 
-    /// CHECK: This PDA is used as the authority for vaults
+/// CHECK: This PDA is used as the authority for token vaults and doesn't need additional checks
     #[account(
         seeds = [b"pool_authority", pool.key().as_ref()],
         bump,
@@ -319,19 +320,20 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(stake_amount: u64)]
 pub struct Stake<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
     pub pool: Account<'info, Pool>,
     #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
-    pub user_stake_account: Account<'info, TokenAccount>,
+    pub user_stake_account: Box<Account<'info, TokenAccount>>,
     #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
-    pub user_reward_account: Account<'info, TokenAccount>,
+    pub user_reward_account: Box<Account<'info, TokenAccount>>,
     #[account(mut)]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut)]
-    pub reward_token_vault: Account<'info, TokenAccount>,
+    pub reward_token_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         init_if_needed,
@@ -342,7 +344,7 @@ pub struct Stake<'info> {
     )]
     pub user_stake: Account<'info, UserStake>,
 
-    /// CHECK: This PDA is used as the authority for vaults
+    /// CHECK: This PDA is used as the authority for token vaults and doesn't need additional checks
     #[account(
         seeds = [b"pool_authority", pool.key().as_ref()],
         bump,
@@ -360,7 +362,7 @@ pub struct Distribute<'info> {
     #[account(mut, has_one = reward_token_vault)]
     pub pool: Account<'info, Pool>,
     #[account()]
-    pub reward_token_vault: Account<'info, TokenAccount>,
+    pub reward_token_vault: Box<Account<'info, TokenAccount>>,
 }
 
 #[derive(Accounts)]
@@ -369,13 +371,13 @@ pub struct Claim<'info> {
     #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
     pub pool: Account<'info, Pool>,
     #[account(mut)]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut)]
-    pub reward_token_vault: Account<'info, TokenAccount>,
+    pub reward_token_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
-    pub user_stake_account: Account<'info, TokenAccount>,
+    pub user_stake_account: Box<Account<'info, TokenAccount>>,
     #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
-    pub user_reward_account: Account<'info, TokenAccount>,
+    pub user_reward_account: Box<Account<'info, TokenAccount>>,
     #[account(mut,
         seeds = [b"user_stake", pool.key().as_ref(), user.key().as_ref()],
         bump = user_stake.bump,
@@ -383,7 +385,7 @@ pub struct Claim<'info> {
     )]
     pub user_stake: Account<'info, UserStake>,
 
-    /// CHECK: This PDA is used as the authority for vaults
+    /// CHECK: This PDA is used as the authority for token vaults and doesn't need additional checks
     #[account(
         seeds = [b"pool_authority", pool.key().as_ref()],
         bump,
@@ -394,15 +396,16 @@ pub struct Claim<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(amount: u64)]
 pub struct Unstake<'info> {
     #[account(mut, has_one = stake_token_vault, has_one = reward_token_vault)]
     pub pool: Account<'info, Pool>,
-    #[account(mut)] pub stake_token_vault: Account<'info, TokenAccount>,
-    #[account(mut)] pub reward_token_vault: Account<'info, TokenAccount>,
+    #[account(mut)] pub stake_token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut)] pub reward_token_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, constraint = user_stake_account.mint == pool.stake_token_mint)]
-    pub user_stake_account: Account<'info, TokenAccount>,
+    pub user_stake_account: Box<Account<'info, TokenAccount>>,
     #[account(mut, constraint = user_reward_account.mint == pool.reward_token_mint)]
-    pub user_reward_account: Account<'info, TokenAccount>,
+    pub user_reward_account: Box<Account<'info, TokenAccount>>,
     #[account(mut,
         seeds = [b"user_stake", pool.key().as_ref(), user.key().as_ref()],
         bump = user_stake.bump,
@@ -410,6 +413,7 @@ pub struct Unstake<'info> {
     )]
     pub user_stake: Account<'info, UserStake>,
     #[account(mut)] pub user: Signer<'info>,
+    /// CHECK: This PDA is used as the authority for token vaults and doesn't need additional checks
     #[account(
         seeds = [b"pool_authority", pool.key().as_ref()],
         bump,
@@ -422,7 +426,9 @@ pub struct Unstake<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct UserStake {
+    /// The staking pool this user stake belongs to
     pub pool: Pubkey,
+    /// The mint of the token being staked
     pub stake_token_mint: Pubkey,
     pub stake_amount: u64,
     pub last_stake_time: i64,
